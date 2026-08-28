@@ -49,6 +49,29 @@ def test_sharpe_known_values():
     print("ok  sharpe")
 
 
+def test_occ_symbol():
+    from datetime import date
+
+    from portfolio_sharpe import Contract
+
+    # Root + YYMMDD + C/P + strike in thousandths, zero-padded to 8.
+    assert (
+        Contract("AMD", date(2026, 8, 31), "Call", 480.0).occ_symbol
+        == "AMD260831C00480000"
+    )
+    # Fractional strike must not lose the half-dollar.
+    assert (
+        Contract("MRVL", date(2026, 8, 21), "Call", 242.5).occ_symbol
+        == "MRVL260821C00242500"
+    )
+    # Sub-$20 strike still pads to the full width.
+    assert (
+        Contract("RGTI", date(2026, 8, 28), "Put", 17.5).occ_symbol
+        == "RGTI260828P00017500"
+    )
+    print("ok  occ_symbol")
+
+
 def test_reconciliation(path):
     """Realized P&L must equal all option cash flow less open positions' cost."""
     legs, other = load_legs(path)
@@ -139,6 +162,7 @@ def test_execution_order(path):
 if __name__ == "__main__":
     test_parse_money()
     test_sharpe_known_values()
+    test_occ_symbol()
 
     if len(sys.argv) > 1:
         csv_path = sys.argv[1]

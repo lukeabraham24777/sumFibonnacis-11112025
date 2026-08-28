@@ -72,6 +72,21 @@ class Contract:
             f"{self.right} ${self.strike:,.2f}"
         )
 
+    @property
+    def occ_symbol(self) -> str:
+        """OCC/OSI symbol, e.g. AMD260831C00480000.
+
+        Root, then YYMMDD expiry, then C or P, then the strike in thousandths
+        padded to eight digits. Every options data vendor keys on this.
+        """
+        thousandths = round(self.strike * 1000)
+        return (
+            f"{self.underlying}"
+            f"{self.expiry:%y%m%d}"
+            f"{self.right[0].upper()}"
+            f"{thousandths:08d}"
+        )
+
 
 @dataclass
 class Leg:
@@ -476,6 +491,7 @@ def format_report(
     spreads: list[Spread],
     capital: float | None,
     risk_free: float,
+    marks: dict | None = None,
 ) -> str:
     out: list[str] = []
     add = out.append
@@ -590,6 +606,29 @@ def format_report(
     add("-" * 72)
     add("SHARPE — HOURLY REGIME")
     add("-" * 72)
+
+    if marks:
+        try:
+            stats = hourly_sharpe(
+                marks, legs, starting_cash=basis, risk_free_annual=risk_free
+            )
+            add(f"  Periods                   {stats['periods']} hours")
+            add(f"  Mean hourly return        {stats['mean_period_return']:+.5%}")
+            add(f"  Hourly volatility         {stats['stdev_period_return']:.5%}")
+            add(f"  Sharpe (per hour)         {stats['sharpe_per_period']:.4f}")
+            add(f"  Sharpe (annualized)       {stats['sharpe_annualized']:.2f}")
+            add(f"  95% CI                    [{stats['ci95_low']:.2f}, "
+                f"{stats['ci95_high']:.2f}]")
+            add("")
+            add("  Fills carry a date but no time, so each is applied at its")
+            add("  trade date's close. Total P&L is exact; the hour within the")
+            add("  entry and exit days is not recoverable from the export.")
+        except (KeyError, ValueError) as exc:
+            add(f"  Not computable: {exc}")
+        add("")
+        add("=" * 72)
+        return "\n".join(out)
+
     add("  NOT COMPUTABLE from this file.")
     add("")
     session_hours = _session_hours(legs[0].trade_date, legs[-1].trade_date)
@@ -602,8 +641,9 @@ def format_report(
     add("")
     add(f"  Required: hourly NBBO marks for {contracts} contracts over their "
         "holding periods.")
-    add("  Sources: ThetaData, Polygon options, Databento, ORATS, CBOE DataShop.")
-    add("  Once supplied, hourly_sharpe() below consumes them directly.")
+    add("  Free sources for a window this recent: Alpaca (Basic plan),")
+    add("  MarketData.app (Free Forever), Databento ($125 signup credit).")
+    add("  Run fetch_hourly_marks.py, then pass --marks marks.json.")
     add("")
     add("  For scale, if the daily series above were re-expressed hourly with")
     add("  identical risk-adjusted performance, the annualization factor moves")
@@ -662,14 +702,21 @@ def hourly_sharpe(
     if len(timestamps) < 2:
         raise ValueError("need at least two hourly marks")
 
+    # Fills carry a date but no time, so a fill is applied at the close of its
+    # trade date: strictly earlier dates are in the position, the fill date
+    # itself is not. Cash and position therefore move together, and total P&L
+    # is exact. What is approximate is *when* within the entry and exit days
+    # the P&L landed — the export cannot say, so a same-day round trip shows
+    # up as a single step rather than an intraday path.
     equity_curve: list[float] = []
+    missing: list[str] = []
+
     for stamp in timestamps:
         cash = starting_cash
         position: dict[Contract, int] = defaultdict(int)
 
         for leg in legs:
-            # Fills carry a date only; treat them as filled by that day's close.
-            if leg.trade_date > stamp.date():
+            if leg.trade_date >= stamp.date():
                 continue
             cash += leg.amount
             position[leg.contract] += leg.quantity if leg.is_long else -leg.quantity
@@ -678,12 +725,26 @@ def hourly_sharpe(
         for contract, qty in position.items():
             if qty == 0:
                 continue
-            mark = hourly_marks.get(str(contract), {}).get(stamp)
+            mark = hourly_marks.get(contract.occ_symbol, {}).get(stamp)
             if mark is None:
-                raise KeyError(f"no mark for {contract} at {stamp}")
+                missing.append(f"{contract.occ_symbol} @ {stamp}")
+                continue
             market_value += qty * mark * 100
 
         equity_curve.append(cash + market_value)
+
+    if missing:
+        raise KeyError(
+            f"{len(missing)} missing marks; first few: {missing[:5]}. "
+            "Every held contract needs a mark at every timestamp, or the "
+            "equity curve jumps where coverage stops."
+        )
+
+    if any(value <= 0 for value in equity_curve):
+        raise ValueError(
+            "equity went non-positive — check starting_cash; it must cover "
+            "the margin these spreads required."
+        )
 
     returns = [
         equity_curve[i] / equity_curve[i - 1] - 1 for i in range(1, len(equity_curve))
@@ -701,6 +762,12 @@ def main() -> None:
         help="annual risk-free rate as a decimal (default 0.042)",
     )
     parser.add_argument(
+        "--marks",
+        default=None,
+        help="JSON of hourly option marks from fetch_hourly_marks.py; "
+        "enables the hourly-regime Sharpe",
+    )
+    parser.add_argument(
         "--capital",
         type=float,
         default=None,
@@ -712,6 +779,20 @@ def main() -> None:
     legs, other_rows = load_legs(args.csv_path)
     if not legs:
         raise SystemExit("no option legs found in the export")
+
+    marks = None
+    if args.marks:
+        import json
+
+        with open(args.marks, encoding="utf-8") as handle:
+            raw = json.load(handle)
+        marks = {
+            symbol: {
+                datetime.fromisoformat(stamp): float(price)
+                for stamp, price in bars.items()
+            }
+            for symbol, bars in raw.items()
+        }
 
     # Leg-level FIFO is run purely as a consistency check: it fails loudly if
     # the export closes a contract it never opened.
@@ -729,6 +810,7 @@ def main() -> None:
             spreads=spreads,
             capital=args.capital,
             risk_free=args.risk_free,
+            marks=marks,
         )
     )
 
